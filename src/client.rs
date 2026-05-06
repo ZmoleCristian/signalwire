@@ -1,1116 +1,275 @@
-use reqwest::{Client as HttpClient, Url};
+//! Async [`SignalWireClient`] — built on `reqwest` + `rustls-tls`.
+
+use std::time::Duration;
+
+use reqwest::{Client as HttpClient, Response, StatusCode};
+use serde::de::DeserializeOwned;
 
 use crate::{errors::SignalWireError, types::*};
 
-#[derive(Debug)]
+/// Default per-request timeout applied to the bundled HTTP client.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Async client for the SignalWire REST API.
+///
+/// Cheap to clone — the inner `reqwest::Client` shares its connection pool
+/// across clones, so prefer cloning over rebuilding.
+///
+/// # Construction
+///
+/// ```no_run
+/// use signalwire::SignalWireClient;
+/// # fn main() -> Result<(), signalwire::SignalWireError> {
+/// let client = SignalWireClient::new("space", "project_id", "api_key")?;
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
 pub struct SignalWireClient {
-    pub project_id: String,
-    pub api_key: String,
-    pub space_name: String,
-    pub http_client: HttpClient,
+    space_name: String,
+    project_id: String,
+    api_key: String,
+    http: HttpClient,
 }
 
 impl SignalWireClient {
-    /// Creates a new SignalWire client.
+    /// Build a client with the default `reqwest` HTTP client (30s timeout, rustls-tls).
     ///
-    /// # Arguments
-    ///
-    /// * `space_name` - The space name of your SignalWire project.
-    /// * `project_id` - The project ID for authentication.
-    /// * `api_key` - The API key for authentication.
-    ///
-    /// # Returns
-    ///
-    /// A new instance of `SignalWireClient`.
-    pub fn new(space_name: &str, project_id: &str, api_key: &str) -> Self {
-        SignalWireClient {
-            space_name: space_name.to_string(),
-            project_id: project_id.to_string(),
-            api_key: api_key.to_string(),
-            http_client: HttpClient::new(),
+    /// Returns `Err(SignalWireError::Http)` if the underlying TLS backend
+    /// fails to initialize.
+    pub fn new(space_name: impl Into<String>, project_id: impl Into<String>, api_key: impl Into<String>) -> Result<Self, SignalWireError> {
+        let http = HttpClient::builder().timeout(DEFAULT_TIMEOUT).build()?;
+        Ok(Self {
+            space_name: space_name.into(),
+            project_id: project_id.into(),
+            api_key: api_key.into(),
+            http,
+        })
+    }
+
+    /// Swap in a custom-configured `reqwest::Client` (proxies, headers, custom TLS, etc.).
+    pub fn with_http_client(mut self, http: HttpClient) -> Self {
+        self.http = http;
+        self
+    }
+
+    /// Project ID this client authenticates as.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// SignalWire space (subdomain) this client targets.
+    pub fn space_name(&self) -> &str {
+        &self.space_name
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("https://{}.signalwire.com{}", self.space_name, path)
+    }
+
+    fn auth(&self, b: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        b.basic_auth(&self.project_id, Some(&self.api_key))
+    }
+
+    /// Translate a JSON response into `T` or the right `SignalWireError` variant.
+    async fn handle<T: DeserializeOwned>(resp: Response) -> Result<T, SignalWireError> {
+        let status = resp.status();
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            return Err(SignalWireError::RateLimited(retry));
+        }
+
+        let body = resp.text().await?;
+
+        match status {
+            StatusCode::UNAUTHORIZED => Err(SignalWireError::Unauthorized),
+            StatusCode::NOT_FOUND => Err(SignalWireError::NotFound(body)),
+            s if s.is_client_error() || s.is_server_error() => Err(SignalWireError::Api { code: s.as_u16(), body }),
+            _ => serde_json::from_str(&body).map_err(|source| SignalWireError::Decode { source, body }),
         }
     }
 
-    /// Retrieves a JSON Web Token (JWT) and a refresh token for authentication.
-    ///
-    /// This method fetches a JWT used for authenticating further requests to the SignalWire API.
-    /// Both a JWT token and a refresh token are returned upon a successful call.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `JwtResponse` with `jwt_token` and `refresh_token` if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Same as [`handle`](Self::handle) but for endpoints that return no body on success.
+    async fn handle_no_content(resp: Response) -> Result<(), SignalWireError> {
+        let status = resp.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(Duration::from_secs);
+            return Err(SignalWireError::RateLimited(retry));
+        }
+        match status {
+            StatusCode::UNAUTHORIZED => Err(SignalWireError::Unauthorized),
+            StatusCode::NOT_FOUND => Err(SignalWireError::NotFound(resp.text().await?)),
+            s if s.is_client_error() || s.is_server_error() => Err(SignalWireError::Api {
+                code: s.as_u16(),
+                body: resp.text().await?,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    // ---------- Auth ----------
+
+    /// Get a JWT + refresh token (`POST /api/relay/rest/jwt`).
     pub async fn get_jwt(&self) -> Result<JwtResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/relay/rest/jwt", self.space_name);
-        let response = self
-            .http_client
-            .post(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .header("Content-Length", "0")
-            .body("")
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        }
-
-        let jwt_response: JwtResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        Ok(jwt_response)
+        let resp = self.auth(self.http.post(self.url("/api/relay/rest/jwt"))).header(reqwest::header::CONTENT_LENGTH, "0").send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `get_jwt`.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `JwtResponse` with `jwt_token` and `refresh_token` if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    // ---------- Phone numbers ----------
 
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `get_jwt`.")]
-    #[cfg(feature = "blocking")]
-    pub fn get_jwt_blocking(&self) -> Result<JwtResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.get_jwt())
+    /// List phone numbers available for purchase in a given country.
+    ///
+    /// Use [`PhoneNumberAvailableQueryParams`] to build the query.
+    /// SignalWire's currently-supported `iso_country` is `"US"`.
+    pub async fn get_phone_numbers_available(&self, iso_country: &str, query: &[(String, String)]) -> Result<PhoneNumbersAvailableResponse, SignalWireError> {
+        let path = format!("/api/laml/2010-04-01/Accounts/{}/AvailablePhoneNumbers/{}/Local", self.project_id, iso_country);
+        let resp = self.auth(self.http.get(self.url(&path))).query(query).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Fetches available phone numbers for a given country.
-    /// Currently the only country supported by SignalWire is "US".
+    /// List phone numbers owned by the project.
     ///
-    /// # Arguments
-    ///
-    /// * `iso_country` - The ISO country code to query against.
-    /// * `query_params` - Additional query parameters as key-value pairs.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either an `PhoneNumbersAvailableResponse` or a `SignalWireError`.
-    pub async fn get_phone_numbers_available(&self, iso_country: &str, query_params: &[(String, String)]) -> Result<PhoneNumbersAvailableResponse, SignalWireError> {
-        let url = format!(
-            "https://{}.signalwire.com/api/laml/2010-04-01/Accounts/{}/AvailablePhoneNumbers/{}/Local",
-            self.space_name, self.project_id, iso_country
-        );
-        println!("URL: {}", url);
-
-        let url = Url::parse_with_params(&url, query_params).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        let response = self
-            .http_client
-            .get(url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let phone_numbers_response: PhoneNumbersAvailableResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        Ok(phone_numbers_response)
+    /// Use [`PhoneNumberOwnedFilterParams`] to filter by name or number.
+    pub async fn get_phone_numbers_owned(&self, query: &[(String, String)]) -> Result<PhoneNumbersOwnedResponse, SignalWireError> {
+        let resp = self.auth(self.http.get(self.url("/api/relay/rest/phone_numbers"))).query(query).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `get_phone_numbers_available`.
+    /// Buy a phone number listed by [`get_phone_numbers_available`](Self::get_phone_numbers_available).
     ///
-    /// # Arguments
-    ///
-    /// * `iso_country` - The ISO country code to query against.
-    /// * `query_params` - Additional query parameters as key-value pairs.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either an `PhoneNumbersAvailableResponse` or a `SignalWireError`.
-
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `get_phone_numbers_available`.")]
-    #[cfg(feature = "blocking")]
-    pub fn get_phone_numbers_available_blocking(&self, iso_country: &str, query_params: &[(String, String)]) -> Result<PhoneNumbersAvailableResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.get_phone_numbers_available(iso_country, query_params))
-    }
-
-    /// Retrieves a list of phone numbers owned by the client.
-    ///
-    /// # Arguments
-    ///
-    /// * `query_params` - Additional query parameters as key-value pairs.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `PhoneNumbersOwnedResponse` with detailed phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    pub async fn get_phone_numbers_owned(&self, query_params: &[(String, String)]) -> Result<PhoneNumbersOwnedResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/relay/rest/phone_numbers", self.space_name);
-
-        let url = Url::parse_with_params(&url, query_params).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        let response = self
-            .http_client
-            .get(url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        } else {
-            let phone_numbers_response: PhoneNumbersOwnedResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-            Ok(phone_numbers_response)
-        }
-    }
-
-    /// Blocking version of `get_phone_numbers_owned`.
-    ///
-    /// # Arguments
-    ///
-    /// * `query_params` - Additional query parameters as key-value pairs.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `OwnedPhoneNumbersResponse` with detailed phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `get_phone_numbers_owned`.")]
-    #[cfg(feature = "blocking")]
-    pub fn get_phone_numbers_owned_blocking(&self, query_params: &[(String, String)]) -> Result<PhoneNumbersOwnedResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.get_phone_numbers_owned(query_params))
-    }
-
-    /// Buy a phone number.
-    ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to buy.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `BuyPhoneNumberResponse` with detailed phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-
+    /// **This costs money.**
     pub async fn buy_phone_number(&self, phone_number: &str) -> Result<BuyPhoneNumberResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/relay/rest/phone_numbers", self.space_name);
-
-        let response = self
-            .http_client
-            .post(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .json(&BuyPhoneNumberRequest { number: phone_number.to_string() })
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let buy_phone_number_response: BuyPhoneNumberResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        Ok(buy_phone_number_response)
+        let body = BuyPhoneNumberRequest { number: phone_number.to_string() };
+        let resp = self.auth(self.http.post(self.url("/api/relay/rest/phone_numbers"))).json(&body).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Updates an existing phone number's configuration.
+    /// Update routing/configuration on an owned phone number.
     ///
-    /// This corresponds to:
-    /// PUT /api/relay/rest/phone_numbers/:id
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The ID of the phone number to update.
-    /// * `request` - The new configuration for the phone number.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `BuyPhoneNumberResponse` with the updated phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// `id` is the resource ID returned in [`OwnedPhoneNumber::id`].
+    /// Any field left `None` in `request` is omitted from the body and the
+    /// server keeps its current value.
     pub async fn update_phone_number(&self, id: &str, request: &UpdatePhoneNumberRequest) -> Result<BuyPhoneNumberResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/relay/rest/phone_numbers/{}", self.space_name, id);
-
-        let response = self
-            .http_client
-            .put(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .header("Accept", "application/json")
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let phone_number_response: BuyPhoneNumberResponse =
-            serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(phone_number_response)
+        let path = format!("/api/relay/rest/phone_numbers/{}", id);
+        let resp = self.auth(self.http.put(self.url(&path))).json(request).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `buy_phone_number`.
-    ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to buy.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `BuyPhoneNumberResponse` with detailed phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    // ---------- SMS ----------
 
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `buy_phone_number`.")]
-    #[cfg(feature = "blocking")]
-    pub fn buy_phone_number_blocking(&self, phone_number: &str) -> Result<BuyPhoneNumberResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.buy_phone_number(phone_number))
-    }
-
-    /// Blocking version of `update_phone_number`.
+    /// Send an SMS message.
     ///
-    /// # Arguments
-    ///
-    /// * `id` - The ID of the phone number to update.
-    /// * `request` - The new configuration for the phone number.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `BuyPhoneNumberResponse` with the updated phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `update_phone_number`.")]
-    #[cfg(feature = "blocking")]
-    pub fn update_phone_number_blocking(&self, id: &str, request: &UpdatePhoneNumberRequest) -> Result<BuyPhoneNumberResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.update_phone_number(id, request))
-    }
-
-    /// Sends an SMS message using the SignalWire API.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The SMS message details including `body`, `from`, and `to`.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SmsResponse` with details about the sent message if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// **This costs money.** `from` must be a number owned by the project (or
+    /// a messaging-service alias).
     pub async fn send_sms(&self, message: &SmsMessage) -> Result<SmsResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts/{}/Messages", self.space_name, self.project_id);
-
+        let path = format!("/api/laml/2010-04-01/Accounts/{}/Messages", self.project_id);
         let form = [("From", &message.from), ("To", &message.to), ("Body", &message.body)];
-
-        let response = self
-            .http_client
-            .post(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let sms_response: SmsResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(sms_response)
+        let resp = self.auth(self.http.post(self.url(&path))).form(&form).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `send_sms`.
+    /// Look up a previously-sent message by SID.
     ///
-    /// # Arguments
-    ///
-    /// * `message` - The SMS message details including `body`, `from`, and `to`.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SmsResponse` with details about the sent message if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `send_sms`.")]
-    #[cfg(feature = "blocking")]
-    pub fn send_sms_blocking(&self, message: &SmsMessage) -> Result<SmsResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.send_sms(message))
-    }
-
-    /// Get the status of a message by its SID (message identifier).
-    ///
-    /// This method allows you to check the current delivery status of a message
-    /// that was previously sent via the SignalWire API.
-    ///
-    /// # Arguments
-    ///
-    /// * `message_sid` - The SID (unique identifier) of the message to check
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SmsResponse` with the complete message details, including its current status
-    /// - `SignalWireError` if the request fails or the message can't be found
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the message SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Use [`SmsResponse::get_status`] for an enum view of the status string.
     pub async fn get_message_status(&self, message_sid: &str) -> Result<SmsResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts/{}/Messages/{}", self.space_name, self.project_id, message_sid);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(SignalWireError::NotFound(format!("Message with SID {} not found", message_sid)));
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let sms_response: SmsResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(sms_response)
+        let path = format!("/api/laml/2010-04-01/Accounts/{}/Messages/{}", self.project_id, message_sid);
+        let resp = self.auth(self.http.get(self.url(&path))).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `get_message_status`.
+    // ---------- Subprojects ----------
+
+    /// List the project's subprojects (sub-accounts).
     ///
-    /// # Arguments
-    ///
-    /// * `message_sid` - The SID (unique identifier) of the message to check
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SmsResponse` with the complete message details, including its current status
-    /// - `SignalWireError` if the request fails or the message can't be found
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the message SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `get_message_status`.")]
-    #[cfg(feature = "blocking")]
-    pub fn get_message_status_blocking(&self, message_sid: &str) -> Result<SmsResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.get_message_status(message_sid))
+    /// The response always contains the main project as the first entry.
+    pub async fn list_subprojects(&self, query: &[(String, String)]) -> Result<SubprojectsListResponse, SignalWireError> {
+        let resp = self.auth(self.http.get(self.url("/api/laml/2010-04-01/Accounts"))).query(query).send().await?;
+        Self::handle(resp).await
     }
 
-    // ---------- Subproject (Account) Methods ----------
-
-    /// Lists all subprojects (accounts) for the current project.
-    ///
-    /// This method returns a list that contains the current Project and any subprojects.
-    ///
-    /// # Arguments
-    ///
-    /// * `query_params` - Optional query parameters for filtering subprojects
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectsListResponse` with the list of subprojects if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    pub async fn list_subprojects(&self, query_params: &[(String, String)]) -> Result<SubprojectsListResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts", self.space_name);
-
-        let url = Url::parse_with_params(&url, query_params).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        let response = self
-            .http_client
-            .get(url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let subprojects_response: SubprojectsListResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(subprojects_response)
-    }
-
-    /// Blocking version of `list_subprojects`.
-    ///
-    /// # Arguments
-    ///
-    /// * `query_params` - Optional query parameters for filtering subprojects
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectsListResponse` with the list of subprojects if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `list_subprojects`.")]
-    #[cfg(feature = "blocking")]
-    pub fn list_subprojects_blocking(&self, query_params: &[(String, String)]) -> Result<SubprojectsListResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.list_subprojects(query_params))
-    }
-
-    /// Get details for a specific subproject (account).
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject to retrieve
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectResponse` with the subproject details if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Fetch a single subproject by SID.
     pub async fn get_subproject(&self, subproject_sid: &str) -> Result<SubprojectResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts/{}", self.space_name, subproject_sid);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(SignalWireError::NotFound(format!("Subproject with SID {} not found", subproject_sid)));
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let subproject_response: SubprojectResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(subproject_response)
+        let path = format!("/api/laml/2010-04-01/Accounts/{}", subproject_sid);
+        let resp = self.auth(self.http.get(self.url(&path))).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `get_subproject`.
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject to retrieve
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectResponse` with the subproject details if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `get_subproject`.")]
-    #[cfg(feature = "blocking")]
-    pub fn get_subproject_blocking(&self, subproject_sid: &str) -> Result<SubprojectResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.get_subproject(subproject_sid))
-    }
-
-    /// Creates a new subproject (account) within the current project.
-    ///
-    /// # Arguments
-    ///
-    /// * `friendly_name` - A human-readable name for the subproject
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectResponse` with the details of the created subproject if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Create a new subproject.
     pub async fn create_subproject(&self, friendly_name: &str) -> Result<SubprojectResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts", self.space_name);
-
         let form = [("FriendlyName", friendly_name)];
-
-        let response = self
-            .http_client
-            .post(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let subproject_response: SubprojectResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(subproject_response)
+        let resp = self.auth(self.http.post(self.url("/api/laml/2010-04-01/Accounts"))).form(&form).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `create_subproject`.
+    /// Update a subproject's friendly name and optionally its status
+    /// (`"active"`, `"suspended"`, or `"closed"`).
     ///
-    /// # Arguments
-    ///
-    /// * `friendly_name` - A human-readable name for the subproject
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectResponse` with the details of the created subproject if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `create_subproject`.")]
-    #[cfg(feature = "blocking")]
-    pub fn create_subproject_blocking(&self, friendly_name: &str) -> Result<SubprojectResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.create_subproject(friendly_name))
-    }
-
-    /// Updates an existing subproject (account).
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject to update
-    /// * `friendly_name` - A new human-readable name for the subproject
-    /// * `status` - Optional status to set for the subproject ("active" or "suspended")
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectResponse` with the updated subproject details if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// SignalWire requires `Status=closed` before [`delete_subproject`](Self::delete_subproject)
+    /// will accept the deletion.
     pub async fn update_subproject(&self, subproject_sid: &str, friendly_name: &str, status: Option<&str>) -> Result<SubprojectResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts/{}", self.space_name, subproject_sid);
-
+        let path = format!("/api/laml/2010-04-01/Accounts/{}", subproject_sid);
         let mut form = vec![("FriendlyName", friendly_name)];
-        if let Some(status_value) = status {
-            form.push(("Status", status_value));
+        if let Some(s) = status {
+            form.push(("Status", s));
         }
-
-        let response = self
-            .http_client
-            .post(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(SignalWireError::NotFound(format!("Subproject with SID {} not found", subproject_sid)));
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let subproject_response: SubprojectResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(subproject_response)
+        let resp = self.auth(self.http.post(self.url(&path))).form(&form).send().await?;
+        Self::handle(resp).await
     }
 
-    /// Blocking version of `update_subproject`.
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject to update
-    /// * `friendly_name` - A new human-readable name for the subproject
-    /// * `status` - Optional status to set for the subproject ("active" or "suspended")
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectResponse` with the updated subproject details if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `update_subproject`.")]
-    #[cfg(feature = "blocking")]
-    pub fn update_subproject_blocking(&self, subproject_sid: &str, friendly_name: &str, status: Option<&str>) -> Result<SubprojectResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.update_subproject(subproject_sid, friendly_name, status))
-    }
-
-    /// Deletes a subproject (account).
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject to delete
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `()` if the subproject was successfully deleted
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Delete a subproject. Must be in `closed` status first
+    /// (see [`update_subproject`](Self::update_subproject)).
     pub async fn delete_subproject(&self, subproject_sid: &str) -> Result<(), SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts/{}", self.space_name, subproject_sid);
-
-        let response = self
-            .http_client
-            .delete(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(SignalWireError::NotFound(format!("Subproject with SID {} not found", subproject_sid)));
-        } else if status.is_client_error() || status.is_server_error() {
-            let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        // Success, return empty result
-        Ok(())
+        let path = format!("/api/laml/2010-04-01/Accounts/{}", subproject_sid);
+        let resp = self.auth(self.http.delete(self.url(&path))).send().await?;
+        Self::handle_no_content(resp).await
     }
 
-    /// Blocking version of `delete_subproject`.
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject to delete
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `()` if the subproject was successfully deleted
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `delete_subproject`.")]
-    #[cfg(feature = "blocking")]
-    pub fn delete_subproject_blocking(&self, subproject_sid: &str) -> Result<(), SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.delete_subproject(subproject_sid))
+    /// List phone numbers owned by a specific subproject.
+    pub async fn get_subproject_phone_numbers(&self, subproject_sid: &str, query: &[(String, String)]) -> Result<SubprojectPhoneNumbersResponse, SignalWireError> {
+        let path = format!("/api/laml/2010-04-01/Accounts/{}/IncomingPhoneNumbers", subproject_sid);
+        let resp = self.auth(self.http.get(self.url(&path))).query(query).send().await?;
+        Self::handle(resp).await
     }
 
-    // ---------- Subproject Resource Methods ----------
+    // ---------- Lookup ----------
 
-    /// Lists phone numbers owned by a specific subproject.
+    /// Validate a phone number and return basic metadata
+    /// (country code, formatting, location, timezone).
     ///
-    /// This method allows you to retrieve all phone numbers that belong to a specific subproject
-    /// using your main account's credentials.
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject
-    /// * `query_params` - Additional query parameters as key-value pairs.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectPhoneNumbersResponse` with detailed phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    pub async fn get_subproject_phone_numbers(&self, subproject_sid: &str, query_params: &[(String, String)]) -> Result<SubprojectPhoneNumbersResponse, SignalWireError> {
-        // First check if the subproject exists
-        self.get_subproject(subproject_sid).await?;
-
-        // URL to get phone numbers from a specific subproject
-        let url = format!("https://{}.signalwire.com/api/laml/2010-04-01/Accounts/{}/IncomingPhoneNumbers", self.space_name, subproject_sid);
-
-        let url = Url::parse_with_params(&url, query_params).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        let response = self
-            .http_client
-            .get(url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(SignalWireError::NotFound(format!("Subproject with SID {} not found", subproject_sid)));
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let phone_numbers_response: SubprojectPhoneNumbersResponse =
-            serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(phone_numbers_response)
-    }
-
-    /// Blocking version of `get_subproject_phone_numbers`.
-    ///
-    /// # Arguments
-    ///
-    /// * `subproject_sid` - The SID (unique identifier) of the subproject
-    /// * `query_params` - Additional query parameters as key-value pairs.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `SubprojectPhoneNumbersResponse` with detailed phone number info if successful.
-    /// - `SignalWireError` if the request fails or is unauthorized.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Returns `SignalWireError::NotFound` if the subproject SID doesn't exist.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `get_subproject_phone_numbers`.")]
-    #[cfg(feature = "blocking")]
-    pub fn get_subproject_phone_numbers_blocking(&self, subproject_sid: &str, query_params: &[(String, String)]) -> Result<SubprojectPhoneNumbersResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.get_subproject_phone_numbers(subproject_sid, query_params))
-    }
-
-    // ---------- Phone Number Lookup & Validation Methods ----------
-
-    /// Looks up and validates a phone number.
-    ///
-    /// This method validates a phone number to ensure it is valid and properly formatted.
-    /// It returns basic information about the number such as country code and formatting.
-    ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to lookup and validate
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `PhoneLookupResponse` with information about the phone number if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Equivalent to `lookup(num, LookupKind::Basic)`.
     pub async fn lookup_phone_number(&self, phone_number: &str) -> Result<PhoneLookupResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/relay/rest/lookup/phone_number/{}", self.space_name, phone_number);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let lookup_response: PhoneLookupResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(lookup_response)
+        self.lookup(phone_number, LookupKind::Basic).await
     }
 
-    /// Blocking version of `lookup_phone_number`.
-    ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to lookup and validate
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `PhoneLookupResponse` with information about the phone number if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `lookup_phone_number`.")]
-    #[cfg(feature = "blocking")]
-    pub fn lookup_phone_number_blocking(&self, phone_number: &str) -> Result<PhoneLookupResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.lookup_phone_number(phone_number))
-    }
-
-    /// Looks up a phone number with carrier information.
-    ///
-    /// This method validates a phone number and returns carrier information about the number,
-    /// including the carrier name and whether it's a mobile, landline, or VoIP number.
-    ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to lookup and validate
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `PhoneLookupResponse` with information about the phone number and carrier if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Lookup with carrier info (`type=carrier`). **Paid endpoint.**
     pub async fn lookup_phone_number_with_carrier(&self, phone_number: &str) -> Result<PhoneLookupResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/relay/rest/lookup/phone_number/{}", self.space_name, phone_number);
-
-        let params = PhoneLookupParams::new().with_carrier().build();
-        let url = Url::parse_with_params(&url, &params).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        let response = self
-            .http_client
-            .get(url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let lookup_response: PhoneLookupResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(lookup_response)
+        self.lookup(phone_number, LookupKind::Carrier).await
     }
 
-    /// Blocking version of `lookup_phone_number_with_carrier`.
-    ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to lookup and validate
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `PhoneLookupResponse` with information about the phone number and carrier if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `lookup_phone_number_with_carrier`.")]
-    #[cfg(feature = "blocking")]
-    pub fn lookup_phone_number_with_carrier_blocking(&self, phone_number: &str) -> Result<PhoneLookupResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.lookup_phone_number_with_carrier(phone_number))
-    }
-
-    /// Looks up a phone number with caller name (CNAM) information.
-    ///
-    /// This method validates a phone number and returns caller name information,
-    /// which provides the registered name of the phone number owner if available.
-    ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to lookup and validate
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `PhoneLookupResponse` with information about the phone number and caller name if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
+    /// Lookup with caller-name (CNAM) info (`type=caller-name`). **Paid endpoint.**
     pub async fn lookup_phone_number_with_caller_name(&self, phone_number: &str) -> Result<PhoneLookupResponse, SignalWireError> {
-        let url = format!("https://{}.signalwire.com/api/relay/rest/lookup/phone_number/{}", self.space_name, phone_number);
-
-        let params = PhoneLookupParams::new().with_caller_name().build();
-        let url = Url::parse_with_params(&url, &params).map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        let response = self
-            .http_client
-            .get(url)
-            .basic_auth(&self.project_id, Some(&self.api_key))
-            .send()
-            .await
-            .map_err(|e| SignalWireError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response.text().await.map_err(|e| SignalWireError::Unexpected(e.to_string()))?;
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SignalWireError::Unauthorized);
-        } else if status.is_client_error() || status.is_server_error() {
-            return Err(SignalWireError::Unexpected(response_text));
-        }
-
-        let lookup_response: PhoneLookupResponse = serde_json::from_str(&response_text).map_err(|e| SignalWireError::Unexpected(format!("Failed to parse response: {}. Response was: {}", e, response_text)))?;
-
-        Ok(lookup_response)
+        self.lookup(phone_number, LookupKind::CallerName).await
     }
 
-    /// Blocking version of `lookup_phone_number_with_caller_name`.
+    /// Generic phone-number lookup. Pick what to fetch via [`LookupKind`].
     ///
-    /// # Arguments
-    ///
-    /// * `phone_number` - The phone number to lookup and validate
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing either:
-    /// - `PhoneLookupResponse` with information about the phone number and caller name if successful
-    /// - `SignalWireError` if the request fails
-    ///
-    /// # Errors
-    ///
-    /// Returns `SignalWireError::Unauthorized` if authentication fails.
-    /// Other `SignalWireError` variants may be returned for unexpected issues.
-    #[cfg_attr(feature = "blocking", doc = "Blocking version of `lookup_phone_number_with_caller_name`.")]
-    #[cfg(feature = "blocking")]
-    pub fn lookup_phone_number_with_caller_name_blocking(&self, phone_number: &str) -> Result<PhoneLookupResponse, SignalWireError> {
-        tokio::runtime::Runtime::new().unwrap().block_on(self.lookup_phone_number_with_caller_name(phone_number))
+    /// `Carrier` and `CallerName` lookups are billed; `Basic` is free.
+    pub async fn lookup(&self, phone_number: &str, kind: LookupKind) -> Result<PhoneLookupResponse, SignalWireError> {
+        let path = format!("/api/relay/rest/lookup/phone_number/{}", phone_number);
+        let mut req = self.auth(self.http.get(self.url(&path)));
+        if let Some((k, v)) = kind.as_query() {
+            req = req.query(&[(k, v)]);
+        }
+        Self::handle(req.send().await?).await
     }
 }

@@ -1,344 +1,228 @@
-# 📞 SignalWire SDK for Rust 🦀
+# SignalWire SDK for Rust
 
-The unofficial SDK for interacting with SignalWire's API using Rust.
-This library provides methods for authentication, phone number management, and messaging capabilities.
+Unofficial SignalWire SDK for Rust. Async by default, optional blocking client behind a feature flag.
 
-## 🚀 Features
+## Features
 
-- 🔐  **Authenticate**: Obtain JWT tokens for secure API access.
-- 📞  **Phone Number Management**: Retrieve available and owned phone numbers.
-- 📱  **SMS Messaging**: Send SMS messages and check delivery status.
-- 🏢  **Subproject Management**: Create, list, update, and delete subprojects (accounts).
-- 🔍  **Phone Number Lookup & Validation**: Validate phone numbers and retrieve carrier and caller information.
-- ⚡ **Asynchronous Support**: Built with async/await using Tokio.
-- 🕛 **Blocking Support**: Support for synchronous operations.
+- JWT auth
+- Phone number management (available, owned, buy)
+- SMS send + delivery status
+- Subproject (account) management
+- Phone number lookup & validation (basic / carrier / CNAM)
+- Built on `reqwest` with `rustls-tls` (no OpenSSL)
+- Real `thiserror`-based error type — preserves status code, response body, transport errors
+- 30s default timeout, `429 Too Many Requests` mapped to `RateLimited(Option<Duration>)`
 
-## 📦 Installation
-
-Add the following to your `Cargo.toml`:
+## Install
 
 ```toml
 [dependencies]
-signalwire = "0.1.8"
-dotenv = "0.15.0"
-tokio = { version = "1.42.0", features = ["full"] }
+signalwire = "0.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-or install with cargo, in the root of your project:
-
-```bash
-cargo add signalwire
-```
-
-or you can request the blocking version:
+Blocking client:
 
 ```toml
 [dependencies]
-signalwire = { version = "0.1.8", features = ["blocking"] }
+signalwire = { version = "0.2", features = ["blocking"] }
 ```
 
-```bash
-cargo add signalwire --features=blocking
-```
-
-## ⚙️ Configuration
-
-You can use environment variables to manage sensitive data. Create a  .env  file in your project root:
+## Configuration
 
 ```bash
-SIGNALWIRE_SPACE_NAME=your_space_name
+# .env
+SIGNALWIRE_SPACE_NAME=your_space
 SIGNALWIRE_PROJECT_ID=your_project_id
 SIGNALWIRE_API_KEY=your_api_key
 ```
 
-## 📚 Usage (Async)
+## Async usage
 
-### Initialize the Client
+### Init
 
 ```rust
-use signalwire::{client::SignalWireClient, errors::SignalWireError};
-use dotenv::dotenv;
-use std::env;
+use signalwire::{SignalWireClient, SignalWireError};
 
 #[tokio::main]
 async fn main() -> Result<(), SignalWireError> {
-    dotenv().ok();
-
-    let space_name = env::var("SIGNALWIRE_SPACE_NAME").expect("Missing space name");
-    let project_id = env::var("SIGNALWIRE_PROJECT_ID").expect("Missing project ID");
-    let api_key = env::var("SIGNALWIRE_API_KEY").expect("Missing API key");
-
-    let client = SignalWireClient::new(&space_name, &project_id, &api_key);
-
-    // Example: Get JWT
-    let jwt_response = client.get_jwt().await?;
-    println!("JWT Token: {}", jwt_response.jwt_token);
-
+    let client = SignalWireClient::new("space", "project_id", "api_key")?;
+    let jwt = client.get_jwt().await?;
+    println!("jwt: {}", jwt.jwt_token);
     Ok(())
 }
 ```
 
-### Get Available Phone Numbers
+### Phone numbers
 
 ```rust
-let client = SignalWireClient::new(&space_name, &project_id, &api_key);
-let query_params = PhoneNumberAvailableQueryParams::new().build();
-let available_numbers = client.get_phone_numbers_available("US", &query_params).await?;
-println!("Available numbers: {:?}", available_numbers);
+use signalwire::{PhoneNumberAvailableQueryParams, PhoneNumberOwnedFilterParams};
+
+let q = PhoneNumberAvailableQueryParams::new().area_code("206").build();
+let available = client.get_phone_numbers_available("US", &q).await?;
+
+let owned = client
+    .get_phone_numbers_owned(&PhoneNumberOwnedFilterParams::new().build())
+    .await?;
+
+let bought = client.buy_phone_number("+12065550100").await?;
 ```
 
-### Get Owned Phone Numbers
+### SMS
 
 ```rust
-let client = SignalWireClient::new(&space_name, &project_id, &api_key);
-let query_params = PhoneNumberOwnedFilterParams::new().build();
-let owned_numbers = client.get_phone_numbers_owned(&query_params).await?;
-println!("Owned numbers: {:?}", owned_numbers);
-```
+use signalwire::SmsMessage;
 
-### Send SMS Message
-
-```rust
-use signalwire::types::SmsMessage;
-
-let client = SignalWireClient::new(&space_name, &project_id, &api_key);
-
-// Create message
-let message = SmsMessage {
-    from: "+15551234567".to_string(),  // Your SignalWire phone number
-    to: "+15557654321".to_string(),    // Recipient's phone number
-    body: "Hello from SignalWire Rust SDK!".to_string(),
+let msg = SmsMessage {
+    from: "+12065550100".into(),
+    to: "+12065550111".into(),
+    body: "hello from rust".into(),
 };
 
-// Send the message
-match client.send_sms(&message).await {
-    Ok(response) => {
-        println!("Message sent with SID: {}", response.sid);
-        println!("Status: {}", response.status);
-    },
-    Err(e) => eprintln!("Failed to send message: {:?}", e),
+let resp = client.send_sms(&msg).await?;
+println!("sid={} status={}", resp.sid, resp.get_status());
+
+let status = client.get_message_status(&resp.sid).await?;
+println!("status: {}", status.get_status()); // MessageStatus enum
+```
+
+### Subprojects
+
+```rust
+use signalwire::SubprojectQueryParams;
+
+let list = client.list_subprojects(&SubprojectQueryParams::new().build()).await?;
+
+let created = client.create_subproject("my-subproject").await?;
+let updated = client.update_subproject(&created.sid, "renamed", None).await?;
+
+// signalwire wants Status=closed before delete
+client.update_subproject(&created.sid, "renamed", Some("closed")).await?;
+client.delete_subproject(&created.sid).await?;
+
+let nums = client
+    .get_subproject_phone_numbers(
+        &created.sid,
+        &PhoneNumberOwnedFilterParams::new().build(),
+    )
+    .await?;
+```
+
+### Lookup
+
+```rust
+use signalwire::LookupKind;
+
+let basic    = client.lookup_phone_number("+12065550100").await?;
+let carrier  = client.lookup(&"+12065550100", LookupKind::Carrier).await?;
+let cnam     = client.lookup(&"+12065550100", LookupKind::CallerName).await?;
+
+// fields are Option<T> — no implicit defaults
+if let Some(true) = basic.valid_number {
+    println!("e164: {}", basic.e164.as_deref().unwrap_or("?"));
 }
 ```
 
-### Check Message Status
+## Blocking usage
+
+Same surface, sync. Built on `reqwest::blocking` — no hand-rolled tokio runtime per call.
 
 ```rust
-// Check the status of a previously sent message
-let message_sid = "previous-message-sid";
+use signalwire::{BlockingClient, SmsMessage};
 
-match client.get_message_status(message_sid).await {
-    Ok(response) => {
-        // Get enum representation of status
-        let status = response.get_status();
-        println!("Message status: {}", status);
-        println!("Sent at: {:?}", response.date_sent);
-        println!("Price: {:?}", response.price);
-    },
-    Err(e) => eprintln!("Failed to check message status: {:?}", e),
-}
-```
+fn main() -> Result<(), signalwire::SignalWireError> {
+    let client = BlockingClient::new("space", "project_id", "api_key")?;
 
-### Manage Subprojects
+    let resp = client.send_sms(&SmsMessage {
+        from: "+12065550100".into(),
+        to: "+12065550111".into(),
+        body: "sync hello".into(),
+    })?;
+    println!("sid: {}", resp.sid);
 
-```rust
-// List subprojects
-let client = SignalWireClient::new(&space_name, &project_id, &api_key);
-let query_params = SubprojectQueryParams::new().build();
-
-match client.list_subprojects(&query_params).await {
-    Ok(response) => {
-        println!("Found {} subproject(s)", response.accounts.len());
-        
-        // Print details about each subproject
-        for account in response.accounts {
-            println!("SID: {}, Name: {}", account.sid, account.friendly_name);
-        }
-    },
-    Err(e) => eprintln!("Failed to list subprojects: {:?}", e),
-}
-
-// Create a new subproject
-let friendly_name = "My New Subproject";
-match client.create_subproject(friendly_name).await {
-    Ok(response) => {
-        println!("Subproject created with SID: {}", response.sid);
-        
-        // Store the SID for later use
-        let subproject_sid = response.sid;
-        
-        // Update the subproject
-        let updated_name = "Updated Subproject Name";
-        match client.update_subproject(&subproject_sid, updated_name, Some("active")).await {
-            Ok(updated) => println!("Subproject updated: {}", updated.friendly_name),
-            Err(e) => eprintln!("Failed to update subproject: {:?}", e),
-        }
-        
-        // List phone numbers belonging to this subproject
-        let query_params = PhoneNumberOwnedFilterParams::new().build();
-        match client.get_subproject_phone_numbers(&subproject_sid, &query_params).await {
-            Ok(numbers) => {
-                println!("Found {} phone number(s) in the subproject", numbers.incoming_phone_numbers.len());
-                for number in numbers.incoming_phone_numbers {
-                    println!("Number: {}", number.phone_number);
-                }
-            },
-            Err(e) => eprintln!("Failed to list subproject phone numbers: {:?}", e),
-        }
-        
-        // Delete the subproject
-        match client.delete_subproject(&subproject_sid).await {
-            Ok(_) => println!("Subproject deleted successfully"),
-            Err(e) => eprintln!("Failed to delete subproject: {:?}", e),
-        }
-    },
-    Err(e) => eprintln!("Failed to create subproject: {:?}", e),
-}
-```
-
-## 📚 Usage (Blocking)
-
-With the `blocking` feature enabled, you can use synchronous versions of all methods:
-
-```rust
-use signalwire::{client::SignalWireClient, errors::SignalWireError, types::SmsMessage};
-use dotenv::dotenv;
-use std::env;
-
-fn main() -> Result<(), SignalWireError> {
-    dotenv().ok();
-
-    let space_name = env::var("SIGNALWIRE_SPACE_NAME").expect("Missing space name");
-    let project_id = env::var("SIGNALWIRE_PROJECT_ID").expect("Missing project ID");
-    let api_key = env::var("SIGNALWIRE_API_KEY").expect("Missing API key");
-
-    let client = SignalWireClient::new(&space_name, &project_id, &api_key);
-
-    // Send SMS (blocking)
-    let message = SmsMessage {
-        from: "+15551234567".to_string(),
-        to: "+15557654321".to_string(),
-        body: "Hello from SignalWire Rust SDK!".to_string(),
-    };
-
-    let response = client.send_sms_blocking(&message)?;
-    println!("Message sent with SID: {}", response.sid);
-
-    // Check message status (blocking)
-    let status_response = client.get_message_status_blocking(&response.sid)?;
-    println!("Message status: {}", status_response.get_status());
-    
-    // List subprojects (blocking)
-    let query_params = SubprojectQueryParams::new().build();
-    let subprojects = client.list_subprojects_blocking(&query_params)?;
-    println!("Found {} subprojects", subprojects.accounts.len());
-
-    // If we have a subproject, get its phone numbers
-    if !subprojects.accounts.is_empty() {
-        let subproject_sid = &subprojects.accounts[0].sid;
-        let phone_params = PhoneNumberOwnedFilterParams::new().build();
-        let numbers = client.get_subproject_phone_numbers_blocking(subproject_sid, &phone_params)?;
-        println!("Subproject has {} phone numbers", numbers.incoming_phone_numbers.len());
-    }
+    let st = client.get_message_status(&resp.sid)?;
+    println!("status: {}", st.get_status());
 
     Ok(())
 }
 ```
 
-### Phone Number Lookup & Validation
+## Error handling
 
 ```rust
-// Validate a phone number
-let phone_number = "+12065550100";
-
-// Basic validation
-match client.lookup_phone_number(phone_number).await {
-    Ok(response) => {
-        println!("Phone number: {}", response.e164.as_deref().unwrap_or(""));
-        println!("Country code: {}", response.country_code);
-        println!("National format: {}", response.national_number_formatted.as_deref().unwrap_or(""));
-        println!("Valid: {}", response.valid_number.unwrap_or(false));
-        println!("Number type: {}", response.number_type.as_deref().unwrap_or(""));
-        println!("Location: {}", response.location.as_deref().unwrap_or(""));
-        println!("Timezones: {:?}", response.timezones);
-    },
-    Err(e) => eprintln!("Failed to lookup phone number: {:?}", e),
+pub enum SignalWireError {
+    Http(reqwest::Error),                 // transport / TLS / timeout
+    Unauthorized,                         // 401
+    NotFound(String),                     // 404 + body
+    RateLimited(Option<Duration>),        // 429 + Retry-After header
+    Api { code: u16, body: String },      // 4xx/5xx
+    Decode { source: serde_json::Error, body: String },
 }
-
-// Get carrier information
-match client.lookup_phone_number_with_carrier(phone_number).await {
-    Ok(response) => {
-        println!("Phone number: {}", response.e164.as_deref().unwrap_or(""));
-        println!("Valid: {}", response.valid_number.unwrap_or(false));
-        println!("Number type: {}", response.number_type.as_deref().unwrap_or(""));
-        println!("Mobile operator: {}", response.number_type.as_deref().unwrap_or("Unknown"));
-    },
-    Err(e) => eprintln!("Failed to lookup phone number with carrier: {:?}", e),
-}
-
-// Get caller name information (CNAM)
-match client.lookup_phone_number_with_caller_name(phone_number).await {
-    Ok(response) => {
-        println!("Phone number: {}", response.e164.as_deref().unwrap_or(""));
-        println!("Valid: {}", response.valid_number.unwrap_or(false));
-        println!("Number type: {}", response.number_type.as_deref().unwrap_or(""));
-        println!("Location: {}", response.location.as_deref().unwrap_or(""));
-    },
-    Err(e) => eprintln!("Failed to lookup phone number with caller name: {:?}", e),
-}
-
-// Helper methods
-let is_valid = response.is_valid();
-let phone_number = response.get_phone_number();
-let national_format = response.get_national_format();
-
-// Blocking versions
-let result = client.lookup_phone_number_blocking(phone_number)?;
-let carrier_result = client.lookup_phone_number_with_carrier_blocking(phone_number)?;
-let cnam_result = client.lookup_phone_number_with_caller_name_blocking(phone_number)?;
 ```
 
-## 🛡️ Error Handling
+Match on it:
 
-The SDK provides a custom error type, `SignalWireError`, to handle various error scenarios, such as:
+```rust
+match client.send_sms(&msg).await {
+    Ok(r) => println!("{}", r.sid),
+    Err(SignalWireError::Unauthorized) => eprintln!("bad creds"),
+    Err(SignalWireError::RateLimited(retry)) => eprintln!("backoff: {retry:?}"),
+    Err(SignalWireError::Api { code, body }) => eprintln!("{code}: {body}"),
+    Err(e) => eprintln!("{e}"),
+}
+```
 
-- `HttpError`: Issues with HTTP requests.
-- `Unauthorized`: Authentication failures.
-- `NotFound`: Resource not found (e.g., invalid message SID).
-- `Unexpected`: Other unexpected errors.
+## Custom HTTP client
 
-## 📜 License
+Inject your own `reqwest::Client` (custom proxies, headers, TLS config):
 
-This project is licensed under the [BSD-3-Clause License](LICENSE)
+```rust
+let http = reqwest::Client::builder()
+    .timeout(std::time::Duration::from_secs(60))
+    .build()?;
 
-## 🤝 Contributing
+let client = SignalWireClient::new("space", "id", "key")?
+    .with_http_client(http);
+```
 
-Contributions are welcome! Please open an issue or submit a pull request.
+## Tests
 
-## 📧 Contact
+Live integration tests live in `tests/live.rs`, all `#[ignore]`-gated. Run manually:
 
-For questions or feedback, reach out to chiarel@tragdate.ninja
+```bash
+cargo test --test live -- --ignored --nocapture jwt_async
+```
 
-## 📝 Changelog
+`send_sms_costs_money` and `subproject_lifecycle` mutate real resources — keep them gated.
+
+## License
+
+[0BSD](LICENSE)
+
+## Changelog
+
+### 0.2.0
+- Full rewrite. Edition 2024.
+- One internal `handle<T>` request helper kills ~600 lines of boilerplate.
+- Blocking client via `reqwest::blocking` (was: hand-rolled tokio runtime per call).
+- `SignalWireError` preserves transport errors, status codes, response bodies. New `RateLimited(Option<Duration>)` variant for 429s.
+- `SignalWireClient::new` / `BlockingClient::new` return `Result` — no `expect`/`unwrap` in the SDK.
+- Private fields on the client (was: `pub api_key` etc.).
+- `Daum` → `OwnedPhoneNumber`. Dead `#[serde(skip_deserializing)]` compat fields on `PhoneLookupResponse` removed.
+- `LookupKind` enum + single `lookup(num, kind)` method (the three named methods kept as thin wrappers).
+- One generic `QueryBuilder` replaces four duplicate query-param builders.
+- Drops `dotenv`, `serde_derive`, `chrono`, `tokio` (runtime), `url` direct deps. `rustls-tls` instead of native-tls.
+- 30s default request timeout.
+- Tests moved to `tests/live.rs`, all `#[ignore]`-gated.
 
 ### 0.1.8
-- Added phone number lookup and validation functionality
-- Added carrier information lookup for phone numbers
-- Added caller name (CNAM) lookup for phone numbers
-- Added tests for the new functionality
+- Phone number lookup and validation, carrier + CNAM info.
 
 ### 0.1.7
-- Added subproject (account) management
-- Added methods for creating, listing, updating, and deleting subprojects
-- Added support for managing phone numbers within subprojects
-- Added tests for the new functionality
+- Subproject (account) management.
 
 ### 0.1.6
-- Added SMS messaging functionality
-- Added message status checking capability
-- Added message status enum for better type safety
-- Added NotFound error variant
+- SMS messaging + status checking + `MessageStatus` enum + `NotFound` error variant.
 
 ### 0.1.5
-- Initial release with JWT authentication
-- Added phone number management
-- Added blocking support
+- Initial release: JWT auth, phone number management, blocking support.

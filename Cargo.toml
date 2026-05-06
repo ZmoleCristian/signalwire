@@ -1,10 +1,10 @@
 [package]
 name = "signalwire"
-version = "0.1.9"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 authors = ["Zmole Cristian <chiarel@tragdate.ninja>"]
 description = "The unofficial SignalWire SDK for Rust."
-license = "BSD-3-Clause"
+license = "0BSD"
 documentation = "https://docs.rs/signalwire"
 repository = "https://github.com/ZmoleCristian/signalwire"
 homepage = "https://tragdate.ninja"
@@ -12,15 +12,16 @@ keywords = ["voip", "signalwire", "communication", "telephony", "sdk"]
 categories = ["network-programming", "asynchronous", "api-bindings"]
 readme = "README.md"
 
-[dependencies]
-dotenv = "0.15.0"
-reqwest = { version = "0.12.9", features = ["json"] }
-serde = { version = "1.0.216", features = ["derive"] }
-serde_derive = "1.0.216"
-serde_json = "1.0.133"
-thiserror = "2.0.8"
-tokio = { version = "1.42.0", features = ["full"] }
-chrono = "0.4.34"
-
 [features]
-blocking = []
+default = []
+blocking = ["reqwest/blocking"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+dotenvy = "0.15"

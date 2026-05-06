@@ -1,34 +1,45 @@
-# Ignore compiled files
+# Build artifacts
 /target/
 **/*.rs.bk
+*.pdb
 
-# Ignore bloated editor files 
+# Lock file (library crate — let consumers resolve)
+/Cargo.lock
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
 /.vscode/
 /.idea/
 /*.iml
-
-# Ignore build artifacts
-/target/
-/Cargo.lock
-
-# Ignore environment files
-.env
-
-# Ignore SoyDev files 
-.DS_Store
-
-# Ignore temporary files
 *.swp
 *.swo
+*~
 
-# Ignore test results
-/tests/results/
+# rust-analyzer / IDE caches
+.rust-analyzer/
+.cargo/
 
-# Ignore logs
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs / coverage
 logs/
 *.log
-
-# Ignore coverage reports
 coverage/
+tarpaulin-report.*
+
+# Test results
+/tests/results/
+
+# Stray local files
+/cleanup_subprojects
+/.signalwire_test_sms_sid
+
+# Tooling
 .claude/
 CLAUDE.md
